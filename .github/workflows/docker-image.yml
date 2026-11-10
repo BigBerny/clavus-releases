@@ -11,7 +11,9 @@
 # run and pushes.
 #
 # Run by hand (Actions → Docker image → Run workflow) to rebuild a release.
-# "Move stable" is off there, so an older release never replaces the newest.
+# Each release builds on its own runner (no queue that could drop one). The
+# stable tag only moves to the newest published (not pre-) server release, so
+# an older or slower build never replaces it.
 
 name: Docker image
 
@@ -32,10 +34,6 @@ permissions:
   contents: read
   packages: write
 
-concurrency:
-  group: docker-image
-  cancel-in-progress: false
-
 jobs:
   image:
     if: github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'server-v')
@@ -43,7 +41,8 @@ jobs:
     timeout-minutes: 150
     env:
       TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
-      STABLE: ${{ github.event_name == 'release' || inputs.stable }}
+      # Asked for: a published (not pre-) release, or "Move stable" when run by hand.
+      STABLE_ASKED: ${{ (github.event_name == 'release' && !github.event.release.prerelease) || inputs.stable }}
       IMAGE: ghcr.io/bigberny/clavus-server
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -78,6 +77,13 @@ jobs:
 
       - name: Build, check and push
         run: |
+          STABLE=false
+          if [ "$STABLE_ASKED" = true ]; then
+            newest="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
+              --jq '.[] | select(.prerelease | not) | select(.draft | not) | .tag_name' \
+              | grep -E '^server-v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)"
+            if [ "$newest" = "$TAG" ]; then STABLE=true; else echo "::notice::$TAG is not the newest server release ($newest): stable stays"; fi
+          fi
           echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
           flags=(--push)
           if [ "$STABLE" = true ]; then flags+=(--stable); fi
