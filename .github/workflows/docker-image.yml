@@ -1,0 +1,89 @@
+# Clavus Server for Linux: builds ghcr.io/bigberny/clavus-server from the
+# signed hosted bundle of each server release and pushes it (tags <version>,
+# <payloadBuildId> and stable). Setup for people: https://getclavus.app/install#linux
+#
+# The release (clavus-server scripts/release.mjs) is published first and its
+# files upload afterwards, so the job waits for Clavus.Hosted.tar.gz and its
+# signature. The bundle is checked against the updater key in this repo
+# (.github/clavus-updater.pub) before anything from it runs; then its own
+# build script (openclaw-client/deploy/hosted/shared/build-self-host-image.sh)
+# builds the image, starts it once with a throwaway volume, checks the first
+# run and pushes.
+#
+# Run by hand (Actions → Docker image → Run workflow) to rebuild a release.
+# "Move stable" is off there, so an older release never replaces the newest.
+
+name: Docker image
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Server release tag, e.g. server-v1.0.107
+        required: true
+      stable:
+        description: Also move the stable tag (what docker-compose.yml pulls)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: docker-image
+  cancel-in-progress: false
+
+jobs:
+  image:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'server-v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
+      STABLE: ${{ github.event_name == 'release' || inputs.stable }}
+      IMAGE: ghcr.io/bigberny/clavus-server
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          sparse-checkout: .github
+
+      - name: Wait for the bundle
+        run: |
+          if [[ ! "$TAG" =~ ^server-v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "::error::not a server release tag: $TAG"
+            exit 1
+          fi
+          echo "VERSION=${BASH_REMATCH[1]}" >> "$GITHUB_ENV"
+          # Up to an hour: the Server.app DMG (~800 MB) uploads in the same run.
+          for i in $(seq 1 120); do
+            n="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" \
+              --jq '[.assets[] | select(.state == "uploaded" and (.name == "Clavus.Hosted.tar.gz" or .name == "Clavus.Hosted.tar.gz.sig"))] | length' 2>/dev/null || echo 0)"
+            if [ "$n" = 2 ]; then exit 0; fi
+            sleep 30
+          done
+          echo "::error::Clavus.Hosted.tar.gz and its signature never arrived on $TAG"
+          exit 1
+
+      - name: Download and check the signature
+        run: |
+          mkdir -p dl bundle
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D dl -p 'Clavus.Hosted.tar.gz' -p 'Clavus.Hosted.tar.gz.sig'
+          node .github/scripts/verify-minisign.mjs dl/Clavus.Hosted.tar.gz dl/Clavus.Hosted.tar.gz.sig .github/clavus-updater.pub
+          tar -xzf dl/Clavus.Hosted.tar.gz -C bundle
+
+      - name: Build, check and push
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          flags=(--push)
+          if [ "$STABLE" = true ]; then flags+=(--stable); fi
+          bash bundle/openclaw-client/deploy/hosted/shared/build-self-host-image.sh bundle "$IMAGE" "$VERSION" "${flags[@]}"
+          {
+            echo "### Clavus Server $VERSION for Linux"
+            echo
+            echo "\`$IMAGE:$VERSION\`$([ "$STABLE" = true ] && echo ' (also stable)')"
+          } >> "$GITHUB_STEP_SUMMARY"
